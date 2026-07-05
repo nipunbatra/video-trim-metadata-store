@@ -29,6 +29,11 @@
 
 * { box-sizing: border-box; }
 
+/* The HTML `hidden` attribute must win over class rules that set display
+   (e.g. .busy-overlay/.account use display:flex, which would otherwise
+   override the UA `[hidden] { display:none }`). */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
