@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Video Trim + Store</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect x='10' y='25' width='80' height='50' rx='8' fill='%234285f4'/><polygon points='42,38 42,62 62,50' fill='white'/></svg>" />
+  <script type="module" src="/src/main.ts"></script>
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">Video Trim <span class="plus">+</span> Store</div>
+    <div class="account" id="account-chip" hidden>
+      <span id="account-email"></span>
+      <button id="btn-signout" class="ghost small">Sign out</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Step 1: sign in -->
+    <section id="screen-signin" class="screen narrow">
+      <h1>Trim Drive recordings, right in the browser</h1>
+      <p class="lede">Pick a video from Google Drive, cut the start and end, add metadata, and save it back to Drive. Everything runs locally in your browser &mdash; no server, nothing uploaded anywhere else.</p>
+      <button id="btn-signin" class="primary big">Connect Google Drive</button>
+      <p class="fineprint">The app can only see files you explicitly pick and files it creates (<code>drive.file</code> scope), never your whole Drive.</p>
+    </section>
+
+    <!-- Step 2: pick a video -->
+    <section id="screen-pick" class="screen narrow" hidden>
+      <h1>Choose a video</h1>
+      <p class="lede">Select a recording from your Drive. It will be downloaded to this browser tab for preview and trimming.</p>
+      <button id="btn-pick" class="primary big">Pick a video from Drive</button>
+    </section>
+
+    <!-- Step 3: edit -->
+    <section id="screen-edit" class="screen wide" hidden>
+      <div class="editor-grid">
+        <div class="panel video-panel">
+          <div class="file-label" id="file-label"></div>
+          <video id="video" controls playsinline preload="metadata"></video>
+          <div id="timeline" class="timeline" aria-label="Trim timeline"></div>
+          <div class="trim-controls">
+            <button id="btn-set-in" title="Shortcut: I">Set start</button>
+            <button id="btn-set-out" title="Shortcut: O">Set end</button>
+            <button id="btn-preview-sel" class="ghost">Preview selection</button>
+          </div>
+          <div class="trim-readout">
+            <span>Start <output id="out-in">0:00.0</output></span>
+            <span>End <output id="out-out">&ndash;</output></span>
+            <span>Keeps <output id="out-len">&ndash;</output></span>
+          </div>
+          <label class="checkbox">
+            <input type="checkbox" id="chk-precise" />
+            <span>Precise cut &mdash; re-encodes (slow). Off: instant lossless cut that snaps to keyframes (may shift a few seconds).</span>
+          </label>
+          <p class="hint">Shortcuts: <kbd>Space</kbd> play/pause &middot; <kbd>I</kbd>/<kbd>O</kbd> set start/end &middot; <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> &plusmn;1s (<kbd>Shift</kbd> &plusmn;5s) &middot; <kbd>[</kbd>/<kbd>]</kbd> jump to start/end</p>
+        </div>
+
+        <div class="panel meta-panel">
+          <h2>Save to Drive</h2>
+          <label class="field">File name
+            <input id="meta-name" type="text" autocomplete="off" />
+          </label>
+          <label class="field">Description
+            <textarea id="meta-desc" rows="3" placeholder="Shown in the Drive file details pane"></textarea>
+          </label>
+          <div class="meta-kv-head">
+            <h3>Metadata</h3>
+            <button id="btn-add-row" class="ghost small" type="button">Add field</button>
+          </div>
+          <div id="meta-rows"></div>
+          <label class="checkbox">
+            <input type="checkbox" id="chk-sidecar" checked />
+            <span>Also save a <code>.json</code> metadata sidecar (works with the subtitle-overlay player)</span>
+          </label>
+          <div class="dest-row">
+            <span>Save in: <strong id="dest-label">My Drive</strong></span>
+            <button id="btn-pick-folder" class="ghost small" type="button">Change folder</button>
+          </div>
+          <button id="btn-save" class="primary big">Trim and save to Drive</button>
+          <button id="btn-download-local" class="ghost">Download trimmed file instead</button>
+          <button id="btn-back" class="ghost small">Pick a different video</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Step 4: done -->
+    <section id="screen-done" class="screen narrow" hidden>
+      <h1>Saved</h1>
+      <p class="lede" id="done-summary"></p>
+      <a id="done-link" class="primary big button-link" target="_blank" rel="noopener">Open in Drive</a>
+      <button id="btn-again" class="ghost">Trim another video</button>
+    </section>
+  </main>
+
+  <!-- Busy overlay -->
+  <div id="busy" class="busy-overlay" hidden>
+    <div class="busy-card">
+      <h2 id="busy-title">Working&hellip;</h2>
+      <progress id="busy-bar" max="1" value="0"></progress>
+      <p id="busy-status"></p>
+      <button id="btn-busy-cancel" class="ghost small" hidden>Cancel</button>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+</body>
+</html>

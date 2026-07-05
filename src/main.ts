@@ -1,0 +1,372 @@
+import './style.css';
+import { initAuth, getToken, signOut, fetchUserEmail } from './auth';
+import { pickVideo, pickFolder, type PickedFile } from './picker';
+import { downloadFile, resumableUpload, uploadSmallFile } from './drive';
+import { trimVideo, toTimestamp } from './trimmer';
+import { Timeline } from './timeline';
+
+const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
+  document.getElementById(id) as T;
+
+const video = $<HTMLVideoElement>('video');
+const timeline = new Timeline($('timeline'));
+
+// ---- state ----
+let picked: PickedFile | null = null;
+let sourceBlob: Blob | null = null;
+let objectUrl = '';
+let duration = 0;
+let destFolder: { id: string; name: string } | null = null;
+let previewingSelection = false;
+
+// ---- tiny UI helpers ----
+function showScreen(id: string): void {
+  for (const s of document.querySelectorAll<HTMLElement>('.screen')) {
+    s.hidden = s.id !== id;
+  }
+}
+
+function toast(msg: string, ms = 6000): void {
+  const t = $('toast');
+  t.textContent = msg;
+  t.hidden = false;
+  setTimeout(() => (t.hidden = true), ms);
+}
+
+function busy(title: string, cancellable = false): void {
+  $('busy-title').textContent = title;
+  $('busy-status').textContent = '';
+  const bar = $<HTMLProgressElement>('busy-bar');
+  bar.removeAttribute('value'); // indeterminate until first progress event
+  $('btn-busy-cancel').hidden = !cancellable;
+  $('busy').hidden = false;
+}
+
+function busyProgress(frac: number | null, status: string): void {
+  const bar = $<HTMLProgressElement>('busy-bar');
+  if (frac === null) bar.removeAttribute('value');
+  else bar.value = frac;
+  $('busy-status').textContent = status;
+}
+
+function busyHide(): void {
+  $('busy').hidden = true;
+}
+
+function fmt(sec: number): string {
+  if (!isFinite(sec)) return '–';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = (sec % 60).toFixed(1).padStart(4, '0');
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
+}
+
+function fmtBytes(n: number): string {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)} GB`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
+  return `${Math.round(n / 1e3)} KB`;
+}
+
+function updateReadout(): void {
+  $('out-in').textContent = fmt(timeline.inSec);
+  $('out-out').textContent = fmt(timeline.outSec);
+  $('out-len').textContent = fmt(timeline.outSec - timeline.inSec);
+}
+
+// ---- metadata key/value rows (video-subtitle-overlay sidecar convention) ----
+function addMetaRow(key = '', value = ''): void {
+  const row = document.createElement('div');
+  row.className = 'kv-row';
+  row.innerHTML = `
+    <input class="kv-key" placeholder="Key (e.g. Lecture)" />
+    <input class="kv-val" placeholder="Value" />
+    <button class="kv-del ghost" type="button" title="Remove">&times;</button>`;
+  (row.querySelector('.kv-key') as HTMLInputElement).value = key;
+  (row.querySelector('.kv-val') as HTMLInputElement).value = value;
+  row.querySelector('.kv-del')!.addEventListener('click', () => row.remove());
+  $('meta-rows').appendChild(row);
+}
+
+function collectMeta(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const row of document.querySelectorAll('#meta-rows .kv-row')) {
+    const k = (row.querySelector('.kv-key') as HTMLInputElement).value.trim();
+    const v = (row.querySelector('.kv-val') as HTMLInputElement).value.trim();
+    if (k && v) out[k] = v;
+  }
+  return out;
+}
+
+// ---- flow ----
+async function handleSignIn(): Promise<void> {
+  const token = await getToken(true);
+  const email = await fetchUserEmail(token);
+  if (email) {
+    $('account-email').textContent = email;
+    $('account-chip').hidden = false;
+  }
+  showScreen('screen-pick');
+}
+
+async function handlePick(): Promise<void> {
+  const token = await getToken();
+  const file = await pickVideo(token);
+  if (!file) return;
+  picked = file;
+
+  if (file.sizeBytes > 1.9e9) {
+    toast(
+      'This file is close to the in-browser 2 GB limit; trimming may fail. Consider desktop ffmpeg for files this large.',
+      9000,
+    );
+  }
+
+  busy('Downloading from Drive');
+  try {
+    sourceBlob = await downloadFile(file.id, token, file.sizeBytes, (rec, total) =>
+      busyProgress(total ? rec / total : null, `${fmtBytes(rec)} of ${fmtBytes(total)}`),
+    );
+  } finally {
+    busyHide();
+  }
+
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  objectUrl = URL.createObjectURL(sourceBlob);
+  video.src = objectUrl;
+  await new Promise<void>((resolve, reject) => {
+    video.onloadedmetadata = () => resolve();
+    video.onerror = () => reject(new Error('This browser cannot play this video format.'));
+  });
+  duration = video.duration;
+  if (!isFinite(duration)) {
+    // Chrome MediaRecorder recordings report Infinity until seeked past end
+    video.currentTime = 1e9;
+    await new Promise<void>((r) => (video.onseeked = () => r()));
+    duration = video.duration;
+    video.currentTime = 0;
+  }
+
+  timeline.setDuration(duration);
+  updateReadout();
+  void timeline.drawFilmstrip(objectUrl);
+
+  $('file-label').textContent = `${file.name} (${fmtBytes(file.sizeBytes)}, ${fmt(duration)})`;
+  $<HTMLInputElement>('meta-name').value = file.name.replace(/\.[^.]+$/, '') + '-trimmed' +
+    (file.name.match(/\.[^.]+$/)?.[0] ?? '.mp4');
+  showScreen('screen-edit');
+}
+
+async function runTrim(): Promise<{ blob: Blob; name: string; mimeType: string }> {
+  if (!sourceBlob || !picked) throw new Error('No video loaded');
+  if (timeline.outSec - timeline.inSec < 0.2) throw new Error('Selection is empty');
+  video.pause();
+  const precise = $<HTMLInputElement>('chk-precise').checked;
+  busy(precise ? 'Trimming (re-encoding)' : 'Trimming (lossless copy)');
+  try {
+    const res = await trimVideo({
+      blob: sourceBlob,
+      inputName: picked.name,
+      startSec: timeline.inSec,
+      endSec: timeline.outSec,
+      precise,
+      onProgress: (r) => busyProgress(r, `${Math.round(r * 100)}%`),
+    });
+    let name = $<HTMLInputElement>('meta-name').value.trim() || res.outputName;
+    const wantedExt = res.outputName.split('.').pop()!;
+    if (!name.toLowerCase().endsWith(`.${wantedExt}`)) {
+      name = name.replace(/\.[^.]+$/, '') + `.${wantedExt}`;
+    }
+    return { blob: res.blob, name, mimeType: res.mimeType };
+  } finally {
+    busyHide();
+  }
+}
+
+async function handleSave(): Promise<void> {
+  const out = await runTrim();
+  const token = await getToken();
+  const meta = collectMeta();
+  const desc = $<HTMLTextAreaElement>('meta-desc').value.trim();
+  const kvLines = Object.entries(meta).map(([k, v]) => `${k}: ${v}`).join('\n');
+
+  const appProperties: Record<string, string> = {
+    tool: 'video-trim-metadata-store',
+    sourceFileId: picked!.id,
+    trimStart: toTimestamp(timeline.inSec),
+    trimEnd: toTimestamp(timeline.outSec),
+  };
+  for (const [k, v] of Object.entries(meta)) {
+    appProperties[k] = v.slice(0, 100); // appProperties values are size-limited
+  }
+
+  busy('Uploading to Drive');
+  let result;
+  try {
+    result = await resumableUpload(
+      out.blob,
+      {
+        name: out.name,
+        mimeType: out.mimeType,
+        description: [desc, kvLines].filter(Boolean).join('\n\n'),
+        parents: destFolder ? [destFolder.id] : undefined,
+        appProperties,
+      },
+      token,
+      (sent, total) => busyProgress(sent / total, `${fmtBytes(sent)} of ${fmtBytes(total)}`),
+    );
+
+    if ($<HTMLInputElement>('chk-sidecar').checked && Object.keys(meta).length > 0) {
+      busyProgress(null, 'Saving metadata sidecar…');
+      await uploadSmallFile(
+        JSON.stringify(meta, null, 2),
+        {
+          name: out.name.replace(/\.[^.]+$/, '') + '.json',
+          mimeType: 'application/json',
+          parents: destFolder ? [destFolder.id] : undefined,
+        },
+        token,
+      );
+    }
+  } finally {
+    busyHide();
+  }
+
+  $('done-summary').textContent =
+    `${result.name} (${fmtBytes(out.blob.size)}) saved to ${destFolder?.name ?? 'My Drive'}.`;
+  $<HTMLAnchorElement>('done-link').href = result.webViewLink;
+  showScreen('screen-done');
+}
+
+async function handleDownloadLocal(): Promise<void> {
+  const out = await runTrim();
+  const url = URL.createObjectURL(out.blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = out.name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+function resetToPick(): void {
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  objectUrl = '';
+  sourceBlob = null;
+  picked = null;
+  destFolder = null;
+  $('dest-label').textContent = 'My Drive';
+  $<HTMLTextAreaElement>('meta-desc').value = '';
+  showScreen('screen-pick');
+}
+
+// ---- wiring ----
+function guard(fn: () => Promise<void>): () => void {
+  return () => {
+    fn().catch((e) => {
+      busyHide();
+      toast(e?.message ?? String(e));
+      console.error(e);
+    });
+  };
+}
+
+timeline.onChange = () => {
+  updateReadout();
+  previewingSelection = false;
+};
+timeline.onSeek = (t) => {
+  video.currentTime = t;
+  previewingSelection = false;
+};
+
+video.addEventListener('timeupdate', () => {
+  timeline.setPlayhead(video.currentTime);
+  if (previewingSelection && video.currentTime >= timeline.outSec) {
+    video.pause();
+    previewingSelection = false;
+  }
+});
+
+$('btn-signin').addEventListener('click', guard(handleSignIn));
+$('btn-signout').addEventListener('click', () => {
+  signOut();
+  $('account-chip').hidden = true;
+  resetToPick();
+  showScreen('screen-signin');
+});
+$('btn-pick').addEventListener('click', guard(handlePick));
+$('btn-set-in').addEventListener('click', () => {
+  timeline.setIn(video.currentTime, true);
+});
+$('btn-set-out').addEventListener('click', () => {
+  timeline.setOut(video.currentTime, true);
+});
+$('btn-preview-sel').addEventListener('click', () => {
+  video.currentTime = timeline.inSec;
+  previewingSelection = true;
+  void video.play();
+});
+$('btn-add-row').addEventListener('click', () => addMetaRow());
+$('btn-pick-folder').addEventListener('click', guard(async () => {
+  const token = await getToken();
+  const folder = await pickFolder(token);
+  if (folder) {
+    destFolder = folder;
+    $('dest-label').textContent = folder.name;
+  }
+}));
+$('btn-save').addEventListener('click', guard(handleSave));
+$('btn-download-local').addEventListener('click', guard(handleDownloadLocal));
+$('btn-back').addEventListener('click', resetToPick);
+$('btn-again').addEventListener('click', resetToPick);
+
+// Keep the file extension in the name field in sync with the trim mode
+// (lossless copy keeps the container; precise re-encode always emits .mp4).
+$('chk-precise').addEventListener('change', () => {
+  if (!picked) return;
+  const srcExt = picked.name.match(/\.([^.]+)$/)?.[1] ?? 'mp4';
+  const target = $<HTMLInputElement>('chk-precise') as HTMLInputElement;
+  const nameInput = $<HTMLInputElement>('meta-name');
+  const newExt = target.checked ? 'mp4' : srcExt;
+  nameInput.value = nameInput.value.replace(/\.[^.]+$/, '') + `.${newExt}`;
+});
+
+document.addEventListener('keydown', (e) => {
+  if ($('screen-edit').hidden) return;
+  const tag = (e.target as HTMLElement).tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+  switch (e.key) {
+    case ' ':
+      e.preventDefault();
+      video.paused ? void video.play() : video.pause();
+      break;
+    case 'i': case 'I':
+      timeline.setIn(video.currentTime, true);
+      break;
+    case 'o': case 'O':
+      timeline.setOut(video.currentTime, true);
+      break;
+    case 'ArrowLeft':
+      video.currentTime = Math.max(0, video.currentTime - (e.shiftKey ? 5 : 1));
+      break;
+    case 'ArrowRight':
+      video.currentTime = Math.min(duration, video.currentTime + (e.shiftKey ? 5 : 1));
+      break;
+    case '[':
+      video.currentTime = timeline.inSec;
+      break;
+    case ']':
+      video.currentTime = timeline.outSec;
+      break;
+  }
+});
+
+// ---- boot ----
+addMetaRow('Lecture');
+addMetaRow('Topic');
+addMetaRow('Date', new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }));
+
+initAuth().catch((e) => toast(`Could not load Google sign-in: ${e.message}`));
+showScreen('screen-signin');
